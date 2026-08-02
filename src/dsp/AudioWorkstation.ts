@@ -1,5 +1,7 @@
 import { ppmEngine } from '../engine/ppm-engine';
 
+export type PresetType = 'clean' | 'warm-tube' | 'blues-crunch' | 'heavy-metal' | 'custom';
+
 export class AudioWorkstation {
   private ctx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
@@ -10,83 +12,80 @@ export class AudioWorkstation {
   public async startGuitarRig(): Promise<void> {
     if (this.isRunning) return;
 
-    // 1. Force low-latency interactive hardware context at 96kHz
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    this.ctx = new AudioCtx({
-      latencyHint: 'interactive',
-      sampleRate: 96000,
-    });
+    this.ctx = new AudioCtx({ latencyHint: 'interactive', sampleRate: 96000 });
 
-    // 2. Pre-allocate SharedArrayBuffer for 0ms parameter pointer writes
-    // Slots: [0: Drive, 1: Cutoff, 2: DelayTime, 3: Feedback]
-    this.sharedBuffer = new SharedArrayBuffer(16);
+    // Expand SharedArrayBuffer to 10 float32 slots (40 bytes)
+    this.sharedBuffer = new SharedArrayBuffer(40);
     this.floatView = new Float32Array(this.sharedBuffer);
 
-    // Initialize Default Parameter Values
-    this.floatView[0] = 1.5;   // Base Drive
-    this.floatView[1] = 3500;  // Base Cutoff (3.5 kHz)
-    this.floatView[2] = 0.25;  // Delay Time (250 ms)
-    this.floatView[3] = 0.35;  // Delay Feedback
+    this.applyPreset('blues-crunch');
 
-    // 3. Load AudioWorklet Module
     await this.ctx.audioWorklet.addModule('/dsp-worklet-processor.js');
 
-    // 4. Request raw, uncolored guitar stream (iRig / USB Interface)
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     });
 
     const micSource = this.ctx.createMediaStreamSource(stream);
-
-    // 5. Instantiate DSP Worklet Node
     this.workletNode = new AudioWorkletNode(this.ctx, 'coral-dsp-processor', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
       outputChannelCount: [2],
-      processorOptions: {
-        sab: this.sharedBuffer,
-      },
+      processorOptions: { sab: this.sharedBuffer },
     });
 
-    // Route Audio: Interface Mic Input -> WASM DSP Worklet -> Speakers / Headphones
     micSource.connect(this.workletNode);
     this.workletNode.connect(this.ctx.destination);
-
     this.isRunning = true;
   }
 
   /**
-   * Synthesizes live SVE Entropy & Latent Drift metrics with PPM Safety Shields
-   * Directly mutates RAM Float32 view with 0ms latency!
+   * Applies Instant DSP Tone Presets
    */
-  public updateSvePpmSteering(entropyScore: number, latentDrift: number): void {
+  public applyPreset(preset: PresetType): void {
     if (!this.floatView) return;
 
-    // Evaluate PPM Shield Rules
-    ppmEngine.evaluateState(entropyScore, latentDrift);
-    const ppmState = ppmEngine.getState();
-
-    // Map SVE metrics to dynamic pedal controls
-    let targetDrive = 1.0 + latentDrift * 10.0;       // Sweep Overdrive (1.0 - 11.0)
-    let targetCutoff = 800 + entropyScore * 12000;     // Sweep Resonant Filter (800Hz - 12.8kHz)
-    let targetFeedback = Math.min(0.8, entropyScore * 0.75);
-
-    // PPM Safety Overrides
-    if (ppmState.threatLevel === 'critical') {
-      targetDrive = 0.8;      // Instant transient damping
-      targetCutoff = 1500;    // Filter emergency rollback
-    } else if (ppmState.threatLevel === 'elevated') {
-      targetDrive *= 0.6;     // Dynamic soft clamping
+    switch (preset) {
+      case 'clean':
+        this.setPedalParams({ tubeMix: 0.1, tubeDrive: 1.0, bluesMix: 0.0, metalMix: 0.0, cutoff: 8000 });
+        break;
+      case 'warm-tube':
+        this.setPedalParams({ tubeMix: 0.8, tubeDrive: 2.2, bluesMix: 0.0, metalMix: 0.0, cutoff: 6500 });
+        break;
+      case 'blues-crunch':
+        // Blends Tube Warmth + Soft Blues Overdrive
+        this.setPedalParams({ tubeMix: 0.4, tubeDrive: 1.8, bluesMix: 0.7, bluesDrive: 2.5, metalMix: 0.0, cutoff: 5200 });
+        break;
+      case 'heavy-metal':
+        // High Gain Metal Hard Clipping + Tight Cabinet Cutoff
+        this.setPedalParams({ tubeMix: 0.3, tubeDrive: 2.0, bluesMix: 0.0, metalMix: 0.95, metalDrive: 6.0, cutoff: 4200 });
+        break;
     }
+  }
 
-    // Atomic 0ms Write directly to system RAM
-    this.floatView[0] = targetDrive;
-    this.floatView[1] = targetCutoff;
-    this.floatView[3] = targetFeedback;
+  /**
+   * Individual Pedal Parameter Mix Control (0.0 to 1.0)
+   */
+  public setPedalParams(params: {
+    gateThr?: number;
+    tubeDrive?: number; tubeMix?: number;
+    bluesDrive?: number; bluesMix?: number;
+    metalDrive?: number; metalMix?: number;
+    cutoff?: number; delayTime?: number; delayFb?: number;
+  }): void {
+    if (!this.floatView) return;
+
+    if (params.gateThr !== undefined) this.floatView[0] = params.gateThr;
+    if (params.tubeDrive !== undefined) this.floatView[1] = params.tubeDrive;
+    if (params.tubeMix !== undefined) this.floatView[2] = params.tubeMix;
+    if (params.bluesDrive !== undefined) this.floatView[3] = params.bluesDrive;
+    if (params.bluesMix !== undefined) this.floatView[4] = params.bluesMix;
+    if (params.metalDrive !== undefined) this.floatView[5] = params.metalDrive;
+    if (params.metalMix !== undefined) this.floatView[6] = params.metalMix;
+    if (params.cutoff !== undefined) this.floatView[7] = params.cutoff;
+    if (params.delayTime !== undefined) this.floatView[8] = params.delayTime;
+    if (params.delayFb !== undefined) this.floatView[9] = params.delayFb;
   }
 
   public stop(): void {
